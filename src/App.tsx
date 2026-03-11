@@ -55,8 +55,8 @@ You are interacting via a low-latency voice API. Keep your responses concise and
 export default function App() {
   const [isActive, setIsActive] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [transcript, setTranscript] = useState<string>("");
   
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -65,10 +65,24 @@ export default function App() {
   const audioQueue = useRef<Int16Array[]>([]);
   const isPlayingRef = useRef(false);
 
+  // Helper to convert ArrayBuffer to Base64 safely
+  const arrayBufferToBase64 = (buffer: ArrayBuffer) => {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return window.btoa(binary);
+  };
+
   // Initialize Audio Context
   const initAudio = async () => {
     if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ 
+        sampleRate: 16000,
+        latencyHint: 'interactive'
+      });
     }
     if (audioContextRef.current.state === 'suspended') {
       await audioContextRef.current.resume();
@@ -89,7 +103,7 @@ export default function App() {
     const buffer = audioContextRef.current.createBuffer(1, chunk.length, 16000);
     const channelData = buffer.getChannelData(0);
     for (let i = 0; i < chunk.length; i++) {
-      channelData[i] = chunk[i] / 32768; // Convert Int16 to Float32
+      channelData[i] = chunk[i] / 32768;
     }
 
     const source = audioContextRef.current.createBufferSource();
@@ -105,6 +119,8 @@ export default function App() {
   const stopSession = () => {
     setIsActive(false);
     setIsSpeaking(false);
+    setMicLevel(0);
+    
     if (processorRef.current) {
       processorRef.current.disconnect();
       processorRef.current = null;
@@ -126,6 +142,16 @@ export default function App() {
       setError(null);
       await initAudio();
 
+      // Request Microphone early to catch permission errors
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        } 
+      });
+      streamRef.current = stream;
+
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
       
       const session = await ai.live.connect({
@@ -140,13 +166,12 @@ export default function App() {
         callbacks: {
           onopen: () => {
             setIsActive(true);
-            console.log("Session opened");
+            console.log("Zaza session active");
           },
           onmessage: async (message: LiveServerMessage) => {
             if (message.serverContent?.modelTurn?.parts) {
               for (const part of message.serverContent.modelTurn.parts) {
                 if (part.inlineData?.data) {
-                  // Decode base64 to Int16Array
                   const binaryString = atob(part.inlineData.data);
                   const bytes = new Uint8Array(binaryString.length);
                   for (let i = 0; i < binaryString.length; i++) {
@@ -163,15 +188,17 @@ export default function App() {
               audioQueue.current = [];
               isPlayingRef.current = false;
               setIsSpeaking(false);
+              if (audioContextRef.current) {
+                // Optional: stop current playback if needed
+              }
             }
           },
           onerror: (err) => {
-            console.error("Live API Error:", err);
-            setError("Connection error. Please try again.");
+            console.error("Zaza Connection Error:", err);
+            setError("Connection lost. Please try again.");
             stopSession();
           },
           onclose: () => {
-            console.log("Session closed");
             stopSession();
           }
         }
@@ -179,23 +206,30 @@ export default function App() {
 
       sessionRef.current = session;
 
-      // Start Microphone
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      
+      // Setup Audio Processing
       const source = audioContextRef.current!.createMediaStreamSource(stream);
       const processor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
       
       processor.onaudioprocess = (e) => {
-        if (!sessionRef.current) return;
+        if (!sessionRef.current || !isActive) return;
         
         const inputData = e.inputBuffer.getChannelData(0);
+        
+        // Calculate volume for visualizer
+        let sum = 0;
+        for (let i = 0; i < inputData.length; i++) {
+          sum += inputData[i] * inputData[i];
+        }
+        const rms = Math.sqrt(sum / inputData.length);
+        setMicLevel(Math.min(1, rms * 5)); // Boost for visibility
+
+        // Convert to Int16 for Gemini
         const int16Data = new Int16Array(inputData.length);
         for (let i = 0; i < inputData.length; i++) {
           int16Data[i] = Math.max(-1, Math.min(1, inputData[i])) * 32767;
         }
         
-        const base64Data = btoa(String.fromCharCode(...new Uint8Array(int16Data.buffer)));
+        const base64Data = arrayBufferToBase64(int16Data.buffer);
         sessionRef.current.sendRealtimeInput({
           media: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
         });
@@ -205,9 +239,13 @@ export default function App() {
       processor.connect(audioContextRef.current!.destination);
       processorRef.current = processor;
 
-    } catch (err) {
-      console.error("Failed to start session:", err);
-      setError("Microphone access or API connection failed.");
+    } catch (err: any) {
+      console.error("Zaza Startup Error:", err);
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setError("Microphone access denied. Please enable it in your browser.");
+      } else {
+        setError("Could not start Zaza. Check your connection.");
+      }
       stopSession();
     }
   };
@@ -256,11 +294,11 @@ export default function App() {
 
       {/* Main Content */}
       <main className="relative z-10 flex-1 flex flex-col items-center justify-center px-6">
-        <div className="max-w-md w-full text-center space-y-12">
+        <div className="max-w-md w-full text-center space-y-8">
           
           {/* Visualizer Area */}
           <div className="relative">
-            <VoiceVisualizer isActive={isActive} isSpeaking={isSpeaking} />
+            <VoiceVisualizer isActive={isActive} isSpeaking={isSpeaking} micLevel={micLevel} />
             
             <AnimatePresence>
               {!isActive && (
@@ -270,8 +308,8 @@ export default function App() {
                   exit={{ opacity: 0, y: -10 }}
                   className="absolute inset-0 flex items-center justify-center"
                 >
-                  <p className="text-pink-200/60 text-sm font-light italic">
-                    "I am Elsa assistant, how can I help you?"
+                  <p className="text-pink-200/60 text-sm font-light italic px-8">
+                    "I am Elsa assistant, how can I help you? / Je suis l'assistant d'Elsa, comment puis-je vous aider ?"
                   </p>
                 </motion.div>
               )}
@@ -284,28 +322,32 @@ export default function App() {
               whileHover={{ scale: 1.05 }}
               whileTap={{ scale: 0.95 }}
               onClick={toggleSession}
-              className={`relative group w-24 h-24 rounded-full flex items-center justify-center transition-all duration-500 ${
+              className={`relative group w-28 h-28 rounded-full flex items-center justify-center transition-all duration-500 ${
                 isActive 
-                  ? 'bg-pink-600 shadow-[0_0_30px_rgba(219,39,119,0.6)]' 
+                  ? 'bg-pink-600 shadow-[0_0_50px_rgba(219,39,119,0.5)]' 
                   : 'bg-white/5 border border-white/10 hover:border-pink-500/50'
               }`}
             >
               <div className={`absolute inset-0 rounded-full bg-pink-500 opacity-0 group-hover:opacity-10 transition-opacity ${isActive ? 'animate-pulse opacity-20' : ''}`} />
               {isActive ? (
-                <MicOff size={32} className="text-white" />
+                <MicOff size={36} className="text-white" />
               ) : (
-                <Mic size={32} className="text-pink-400 group-hover:text-pink-300" />
+                <Mic size={36} className="text-pink-400 group-hover:text-pink-300" />
               )}
             </motion.button>
 
-            <div className="space-y-2">
-              <p className="text-xs uppercase tracking-widest text-pink-400 font-semibold">
-                {isActive ? 'Listening...' : 'Tap to start conversation'}
+            <div className="space-y-3">
+              <p className={`text-xs uppercase tracking-[0.2em] transition-colors duration-300 ${isActive ? 'text-pink-400 font-bold' : 'text-pink-200/40'}`}>
+                {isActive ? 'Zaza is listening...' : 'Tap the mic to talk to Zaza'}
               </p>
               {error && (
-                <p className="text-xs text-red-400 bg-red-400/10 px-3 py-1 rounded-full border border-red-400/20">
+                <motion.p 
+                  initial={{ opacity: 0, scale: 0.9 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="text-[10px] text-red-400 bg-red-400/10 px-4 py-2 rounded-xl border border-red-400/20 max-w-xs mx-auto"
+                >
                   {error}
-                </p>
+                </motion.p>
               )}
             </div>
           </div>
@@ -317,37 +359,38 @@ export default function App() {
         <motion.div 
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
-          className="max-w-2xl mx-auto backdrop-blur-xl bg-white/5 border border-white/10 rounded-3xl p-6 flex flex-col md:flex-row gap-6 items-center"
+          className="max-w-2xl mx-auto backdrop-blur-2xl bg-white/5 border border-white/10 rounded-[2rem] p-6 flex flex-col md:flex-row gap-6 items-center shadow-2xl"
         >
-          <div className="w-16 h-16 rounded-2xl overflow-hidden border border-pink-500/30 flex-shrink-0">
+          <div className="w-20 h-20 rounded-2xl overflow-hidden border border-pink-500/30 flex-shrink-0 relative group">
             <img 
               src="https://picsum.photos/seed/elsa/200/200" 
               alt="Elsa Planes" 
-              className="w-full h-full object-cover grayscale hover:grayscale-0 transition-all duration-700"
+              className="w-full h-full object-cover grayscale group-hover:grayscale-0 transition-all duration-700"
               referrerPolicy="no-referrer"
             />
+            <div className="absolute inset-0 bg-pink-500/10 group-hover:bg-transparent transition-colors" />
           </div>
           
           <div className="flex-1 text-center md:text-left">
-            <h3 className="text-pink-100 font-medium">Elsa Planes</h3>
-            <p className="text-xs text-pink-400/80 mb-2">Marketing & Communication Specialist</p>
-            <div className="flex flex-wrap justify-center md:justify-start gap-3">
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-pink-500/10 border border-pink-500/20 text-pink-300 uppercase tracking-tighter">ESCE Paris</span>
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-pink-500/10 border border-pink-500/20 text-pink-300 uppercase tracking-tighter">Bilingual EN/FR</span>
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-pink-500/10 border border-pink-500/20 text-pink-300 uppercase tracking-tighter">Available Late 2026</span>
+            <h3 className="text-pink-100 font-medium text-lg">Elsa Planes</h3>
+            <p className="text-xs text-pink-400/80 mb-3 font-light tracking-wide">Marketing & Communication Specialist</p>
+            <div className="flex flex-wrap justify-center md:justify-start gap-2">
+              <span className="text-[9px] px-2.5 py-1 rounded-lg bg-pink-500/10 border border-pink-500/20 text-pink-300 uppercase tracking-wider">ESCE Paris 2026</span>
+              <span className="text-[9px] px-2.5 py-1 rounded-lg bg-pink-500/10 border border-pink-500/20 text-pink-300 uppercase tracking-wider">Bilingual EN/FR</span>
+              <span className="text-[9px] px-2.5 py-1 rounded-lg bg-pink-500/10 border border-pink-500/20 text-pink-300 uppercase tracking-wider">Seeking CDI/CDD</span>
             </div>
           </div>
 
-          <div className="flex gap-2">
-            <div className="flex items-center gap-1.5 text-[10px] text-pink-400/60 uppercase tracking-widest">
-              <Languages size={12} />
-              <span>FR / EN</span>
+          <div className="flex flex-col items-end gap-2">
+            <div className="flex items-center gap-2 text-[10px] text-pink-400/60 uppercase tracking-[0.2em] font-medium">
+              <Languages size={14} />
+              <span>FR / EN / IT</span>
             </div>
           </div>
         </motion.div>
         
-        <p className="text-center mt-6 text-[9px] uppercase tracking-[0.4em] text-pink-500/30">
-          Futuristic Interface • Powered by Gemini 2.5 Live
+        <p className="text-center mt-8 text-[8px] uppercase tracking-[0.5em] text-pink-500/20">
+          Futuristic Voice Interface • Powered by Gemini Live
         </p>
       </footer>
     </div>
