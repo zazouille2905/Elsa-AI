@@ -1,0 +1,7 @@
+{
+  "name": "Zaza - Elsa's AI Assistant",
+  "description": "A futuristic, voice-enabled personal AI assistant for Elsa Planes, built with Gemini Live API.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
